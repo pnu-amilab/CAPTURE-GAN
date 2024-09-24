@@ -1,5 +1,9 @@
 from os.path import join
 
+from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.tensorboard import SummaryWriter
+import torch.autograd as autograd
+
 from torch.autograd import Variable
 
 from model import *
@@ -13,12 +17,9 @@ from datetime import datetime
 from torchvision import transforms
 import torchvision.utils as vutils
 
-MEAN = 0
-STD = 1.
-
-
+##
 def train(args):
-    # training params
+    # Training Parameters
     mode = args.mode
     train_continue = args.train_continue
 
@@ -58,16 +59,17 @@ def train(args):
     wgt_ident = args.wgt_ident
     wgt_cls = args.wgt_cls
 
-    lambda_cls = args.lambda_cls
-
     network = args.network
     learning_type = args.learning_type
     network_block = args.network_block
 
     use_mask = args.use_mask
     use_externalmask = args.use_externalmask
-    pretrain_c_first = args.pretrain_c_first
-    pretrain_c_second = args.pretrain_c_second
+    pretrain_c_path = args.pretrain_c_path
+
+    WW = args.ww
+    WL = args.wl
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     print("mode: %s" % mode)
@@ -96,13 +98,13 @@ def train(args):
     print("device: %s" % device)
 
     # writer = SummaryWriter(join('results', args.experiment_name, 'summary'))
-    ## Training networks
+    # Training Networks
     if mode == 'train':
         transform_train = transforms.Compose([Resize(shape=(286, 286, nch)),
                                               RandomCrop((ny, nx)),
-                                              Normalization(mean=MEAN, std=STD)])
+                                              Normalization()])
 
-        transform_train_c = transforms.Compose([Normalization(mean=MEAN, std=STD)])
+        transform_train_c = transforms.Compose([Normalization()])
 
         loader_train_ac = get_loader(data_dir, transform_train, 'AC',
                                     use_mask, batch_size, num_worker, 'train')
@@ -123,17 +125,19 @@ def train(args):
 
             mask_queue = QueueMask(min(loader_train_ac.__len__(), loader_train_bd.__len__()) / 4)
 
+
     ## Build network
     if network == "CycleGAN":
         # a2b: artifact-free to artifact
         netG_a2b = CycleGAN(input_nc=nch, output_nc=nch, nker=nker, norm=norm, nblk=nblk, learning_type=learning_type, network_block=network_block, use_mask=use_mask).to(device)
+
         # b2a: artifact to artifact-free
         netG_b2a = CycleGAN(input_nc=nch, output_nc=nch, nker=nker, norm=norm, nblk=nblk, learning_type=learning_type, network_block=network_block, use_mask=False).to(device)
 
         netD_a = Discriminator_cycle(input_nc=nch, output_nc=1, nker=nker, norm=norm).to(device)
         netD_b = Discriminator_cycle(input_nc=nch, output_nc=1, nker=nker, norm=norm).to(device)
 
-        netC = Classifier(pretrain_c_first).to(device)
+        netC = Classifier(pretrain_c_path).to(device)
 
         init_weights(netG_a2b, init_type='kaiming', init_gain=0.02)
         init_weights(netG_b2a, init_type='kaiming', init_gain=0.02)
@@ -150,17 +154,15 @@ def train(args):
     fn_gan = nn.BCELoss()
     fn_cls = nn.CrossEntropyLoss()
 
-    ## Tensorboard SummaryWriter
     # writer_train = SummaryWriter(log_dir=os.path.join(log_dir, 'train'))
 
-    ## 네트워크 학습시키기
+    ## Train Networks
     st_epoch = 0
 
     # TRAIN MODE
     if network == "CycleGAN":
 
         if train_continue == "on":
-
             netG_a2b, netG_b2a, \
             netD_a, netD_b, netC, \
             optimG, optimD, st_epoch = load(ckpt_dir=ckpt_dir,
@@ -168,14 +170,14 @@ def train(args):
                                             netD_a=netD_a, netD_b=netD_b, netC=netC,
                                             optimG=optimG, optimD=optimD)
         # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimC, T_max=30)
-        netC.load_state_dict(torch.load(pretrain_c_first))
-
+        # loss_C_all = []
         for epoch in range(st_epoch + 1, num_epoch + 1):
 
             netG_a2b.train()
             netG_b2a.train()
             netD_a.train()
             netD_b.train()
+            netC.train()
 
             for batch, data in enumerate(zip(loader_train_ac, loader_train_bd), 1):
                 data_a, data_b = data
@@ -228,8 +230,6 @@ def train(args):
                 set_requires_grad([netD_a, netD_b], True)
                 optimD.zero_grad()
 
-                # Valina GAN
-
                 # backward netD_a
                 pred_real_a = netD_a(real_a)
                 pred_fake_a = netD_a(fake_a.detach())
@@ -278,16 +278,28 @@ def train(args):
                 loss_ident_a = fn_ident(real_a, ident_a)
                 loss_ident_b = fn_ident(real_b, ident_b)
 
-                fake_a_a_3 = ident_a.expand(ident_a.shape[0], 3, *ident_a.shape[2:])  # a to a
-                fake_b_a_3 = fake_a.expand(fake_a.shape[0], 3, *fake_a.shape[2:])  # b to a
+                fake_a_a_3 = ident_a.expand(ident_a.shape[0], 3, *ident_a.shape[2:])  # a from a
+                fake_b_a_3 = fake_a.expand(fake_a.shape[0], 3, *fake_a.shape[2:])  # a from b
 
                 pred_fake_a_a_cls = netC(fake_a_a_3)
                 pred_fake_b_a_cls = netC(fake_b_a_3)
 
                 loss_cls_a_a = fn_cls(pred_fake_a_a_cls, att_edema_a)
                 loss_cls_b_a = fn_cls(pred_fake_b_a_cls, att_edema_b)
+                # loss_cls_a = fn_cls(pred_real_a_cls, att_edema_a)
 
-                loss_cls_g = (loss_cls_a_a + loss_cls_b_a)
+                pred_fake_a_a_cls_b = (fake_a_a_3)
+                pred_fake_b_a_cls_b = (fake_b_a_3)
+                # pred_real_a_cls_b = (real_a_3)
+
+                loss_cls_a_a_b = fn_cls(pred_fake_a_a_cls_b, att_edema_a)
+                loss_cls_b_a_b = fn_cls(pred_fake_b_a_cls_b, att_edema_b)
+                # loss_cls_a_b = fn_cls(pred_real_a_cls_b, att_edema_a)
+
+                loss_cls_g_a = (loss_cls_a_a + loss_cls_b_a)
+                loss_cls_g_b = (loss_cls_a_a_b + loss_cls_b_a_b)
+
+                loss_cls_g = loss_cls_g_a + loss_cls_g_b
 
                 loss_G = wgt_gan * (loss_G_a2b + loss_G_b2a) + \
                          wgt_cycle * (loss_cycle_a + loss_cycle_b) + \
@@ -311,6 +323,13 @@ def train(args):
                     sample_img_dir,
                     'Epoch_({:d}).jpg'.format(epoch)
                 ), nrow=1, normalize=True, value_range=(-1., 1.))
+
+            if epoch % (save_interval * 10) == 0:
+                save(ckpt_dir=ckpt_dir, epoch=epoch,
+                     netG_a2b=netG_a2b, netG_b2a=netG_b2a,
+                     netD_a=netD_a, netD_b=netD_b,
+                     netC=netC, optimG=optimG, optimD=optimD,
+                     standard=None, gc_only=False)
 
 
 
